@@ -75,7 +75,7 @@ class Transcoders(nn.Module):
         self.input_dim = input_dim
         self.latent_dim = int(input_dim * expansion_factor)
         self.decoder = nn.Parameter(torch.zeros(self.latent_dim, self.input_dim))
-        dtype=torch.float32
+        dtype=torch.bfloat16
         #nn.init.kaiming_uniform_(self.decoder)
         self.encoder = nn.Linear(self.input_dim, self.latent_dim, dtype=torch.float32)
         self.encoder.bias.data.zero_()
@@ -182,13 +182,20 @@ import torch.optim as optim
 from datasets import load_dataset
 
 # Load the openwebtext dataset
-dataset = load_dataset("Skylion007/openwebtext",streaming=True)['train']
+
 
 
 
 def ddp_setup():
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        print("Error: LOCAL_RANK is not set!")
+    else:
+        print("LOCAL_RANK:", local_rank)
+    torch.cuda.set_device(int(local_rank))
     init_process_group(backend="nccl")
+    print("Process group initialized.")
+    print("Rank:", torch.distributed.get_rank(), "World Size:", torch.distributed.get_world_size())
 
 class Trainer:
     def __init__(
@@ -201,7 +208,7 @@ class Trainer:
         model1: torch.nn.Module
     ) -> None:
         self.gpu_id = int(os.environ["LOCAL_RANK"])
-        self.model = model.to(self.gpu_id)
+        self.model=model
         self.model1=model1.to(self.gpu_id)
         self.train_data = train_data
         self.optimizer = optimizer
@@ -212,8 +219,12 @@ class Trainer:
             print("Loading snapshot")
             self._load_snapshot(snapshot_path)
 
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
-        self.model1=DDP(self.model1,device_ids=[self.gpu_id])
+        
+
+# Assuming ddp_setup() has been called already.
+        
+        self.model = DDP(model,device_ids=[self.gpu_id])
+        self.model1=DDP(model1,device_ids=[self.gpu_id])
 
     def _load_snapshot(self, snapshot_path):
         loc = f"cuda:{self.gpu_id}"
@@ -225,34 +236,34 @@ class Trainer:
     def _run_batch(self, batch,epoch):
 
 
-
+        tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
 
         if epoch==0:
-            inputs = tokenizer(batch['text'], return_tensors='pt', padding="max_length", truncation=True,max_length=4)
+            inputs = tokenizer(batch['text'], return_tensors='pt', padding="max_length", truncation=True,max_length=2048)
             inputs = {k: v.to(self.gpu_id) for k, v in inputs.items()}
             MLP_output=gather_mlp_output(self.model.module,3,inputs)
             activations=gather_mlp_input(self.model.module,3,inputs)
             activations_flattened = activations.reshape(-1, 4096).to(self.gpu_id)
             mlp_output_flattened = MLP_output.reshape(-1, 4096).to(self.gpu_id)
-            model1.b_dec.weight=empirical_mean
             print(activations_flattened.shape)
             print(mlp_output_flattened.shape)
             self.optimizer.zero_grad()
             encoded,decode,loss,l0_norm=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
+            empirical_mean=mlp_output_flattened.mean(dim=-1)
+            self.model1.module.b_dec.weight=empirical_mean
             print(loss)
-            print(l0_norm//4)
+            print(l0_norm//2048*10)
             loss.backward()
             self.optimizer.step()
-            with torch.no_grad():
-                model1.decoder.copy_(model1.decoder / model1.decoder.norm(dim=1, keepdim=True))
+            
 
             del activations, activations_flattened
             torch.cuda.empty_cache()
             return
             
-        tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
         
-        inputs = tokenizer(batch['text'], return_tensors='pt', padding="max_length", truncation=True,max_length=4)
+        
+        inputs = tokenizer(batch['text'], return_tensors='pt', padding="max_length", truncation=True,max_length=2048)
         inputs = {k: v.to(self.gpu_id) for k, v in inputs.items()}
         MLP_output=gather_mlp_output(self.model.module,3,inputs)
         activations=gather_mlp_input(self.model.module,3,inputs)
@@ -263,12 +274,10 @@ class Trainer:
         self.optimizer.zero_grad()
         encoded,decode,loss,l0_norm=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
         print(loss)
-        print(l0_norm//4)
+        print(l0_norm//(2048*10))
         loss.backward()
         self.optimizer.step()
-        with torch.no_grad():
-            model1.decoder.copy_(model1.decoder / model1.decoder.norm(dim=1, keepdim=True))
-
+        
         del activations, activations_flattened
         torch.cuda.empty_cache()
 
@@ -303,10 +312,10 @@ class Trainer:
 
 def load_train_objs(batch_size):
      # load your dataset
-    model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+    model = AutoModelForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B",load_in_8bit=True)
     model1=Transcoders(batch_size=batch_size,input_dim=4096) # load your model
     
-    optimizer = SignSGD(model.parameters(), lr=1e-5)
+    optimizer = SignSGD(model1.parameters(), lr=1e-5)
     return  model,model1,optimizer
 
 def prepare_dataloader(dataset: Dataset, batch_size: int):
