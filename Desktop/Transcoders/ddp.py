@@ -119,7 +119,7 @@ class Transcoders(nn.Module):
         mean_encoded=mean_encoded/len(self.k_values)
         mean_decoded=mean_decoded/len(self.k_values)
         l0_norm = torch.count_nonzero(encoded,dim=0)
-        l0_norm_final=torch.sum(encoded)
+        l0_norm_final=torch.sum(l0_norm)
         
         total_loss=total_loss/ total_variance
         approximation_of_l0_norm=torch.norm(mean_encoded, p=1)
@@ -222,7 +222,34 @@ class Trainer:
         self.epochs_run = snapshot["EPOCHS_RUN"]
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
 
-    def _run_batch(self, batch):
+    def _run_batch(self, batch,epoch):
+
+
+
+
+        if epoch==0:
+            inputs = tokenizer(batch['text'], return_tensors='pt', padding="max_length", truncation=True,max_length=4)
+            inputs = {k: v.to(self.gpu_id) for k, v in inputs.items()}
+            MLP_output=gather_mlp_output(self.model.module,3,inputs)
+            activations=gather_mlp_input(self.model.module,3,inputs)
+            activations_flattened = activations.reshape(-1, 4096).to(self.gpu_id)
+            mlp_output_flattened = MLP_output.reshape(-1, 4096).to(self.gpu_id)
+            model1.b_dec.weight=empirical_mean
+            print(activations_flattened.shape)
+            print(mlp_output_flattened.shape)
+            self.optimizer.zero_grad()
+            encoded,decode,loss,l0_norm=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
+            print(loss)
+            print(l0_norm//4)
+            loss.backward()
+            self.optimizer.step()
+            with torch.no_grad():
+                model1.decoder.copy_(model1.decoder / model1.decoder.norm(dim=1, keepdim=True))
+
+            del activations, activations_flattened
+            torch.cuda.empty_cache()
+            return
+            
         tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
         
         inputs = tokenizer(batch['text'], return_tensors='pt', padding="max_length", truncation=True,max_length=4)
@@ -239,6 +266,8 @@ class Trainer:
         print(l0_norm//4)
         loss.backward()
         self.optimizer.step()
+        with torch.no_grad():
+            model1.decoder.copy_(model1.decoder / model1.decoder.norm(dim=1, keepdim=True))
 
         del activations, activations_flattened
         torch.cuda.empty_cache()
@@ -247,11 +276,14 @@ class Trainer:
         
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {batch_size} ")
         self.train_data.sampler.set_epoch(epoch)
+
+        
         for batch in self.train_data:
             
-            
-            self._run_batch(batch)
+                
+            self._run_batch(batch,epoch)
             break
+            
             
 
     def _save_snapshot(self, epoch):
@@ -292,6 +324,10 @@ def main(save_every: int, total_epochs: int, batch_size: int, snapshot_path: str
     model,model1, optimizer = load_train_objs(batch_size)
     dataset = load_dataset("Skylion007/openwebtext")['train']
     train_data = prepare_dataloader(dataset, batch_size)
+
+    
+        
+        
     trainer = Trainer(model, train_data, optimizer, save_every, snapshot_path,model1)
     trainer.train(total_epochs,batch_size)
     destroy_process_group()
