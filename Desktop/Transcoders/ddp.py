@@ -339,6 +339,7 @@ def main(save_every: int, total_epochs: int, batch_size: int, snapshot_path: str
         
     trainer = Trainer(model, train_data, optimizer, save_every, snapshot_path,model1)
     trainer.train(total_epochs,batch_size)
+    torch.save(model1.state_dict(),"Transcoder_for_Llama_distilled_8b_layer3.pt")
     destroy_process_group()
 
 
