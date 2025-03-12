@@ -229,7 +229,7 @@ class Trainer:
     def _load_snapshot(self, snapshot_path):
         loc = f"cuda:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
-        self.model.load_state_dict(snapshot["MODEL_STATE"])
+        self.model1.load_state_dict(snapshot["MODEL_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
 
@@ -252,7 +252,7 @@ class Trainer:
             empirical_mean=mlp_output_flattened.mean(dim=-1)
             self.model1.module.b_dec.weight=empirical_mean
             print(loss)
-            print(l0_norm//2048*10)
+            print(l0_norm//(2048*11))
             loss.backward()
             self.optimizer.step()
             
@@ -272,9 +272,11 @@ class Trainer:
         print(activations_flattened.shape)
         print(mlp_output_flattened.shape)
         self.optimizer.zero_grad()
+        print(self.model1.module.decoder)
+        print(self.model1.module.W_skip)
         encoded,decode,loss,l0_norm=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
         print(loss)
-        print(l0_norm//(2048*10))
+        print(l0_norm//(2048*11))
         loss.backward()
         self.optimizer.step()
         
@@ -289,15 +291,16 @@ class Trainer:
         
         for batch in self.train_data:
             
-                
+           
             self._run_batch(batch,epoch)
+            
             break
             
             
 
     def _save_snapshot(self, epoch):
         snapshot = {
-            "MODEL_STATE": self.model.module.state_dict(),
+            "MODEL_STATE": self.model1.module.state_dict(),
             "EPOCHS_RUN": epoch,
         }
         torch.save(snapshot, self.snapshot_path)
@@ -308,6 +311,7 @@ class Trainer:
             self._run_epoch(epoch,batch_size)
             if self.gpu_id == 0 and epoch % self.save_every == 0:
                 self._save_snapshot(epoch)
+                torch.distributed.barrier() 
 
 
 def load_train_objs(batch_size):
@@ -331,7 +335,7 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 def main(save_every: int, total_epochs: int, batch_size: int, snapshot_path: str = "snapshot.pt"):
     ddp_setup()
     model,model1, optimizer = load_train_objs(batch_size)
-    dataset = load_dataset("Skylion007/openwebtext")['train']
+    dataset = load_dataset("Skylion007/openwebtext",trust_remote_code=True)['train']
     train_data = prepare_dataloader(dataset, batch_size)
 
     
