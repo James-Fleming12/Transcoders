@@ -309,8 +309,9 @@ class Trainer:
     def train(self, max_epochs: int,batch_size):
         for epoch in range(self.epochs_run, max_epochs):
             self._run_epoch(epoch,batch_size)
-            if self.gpu_id == 0 and epoch % self.save_every == 0:
-                self._save_snapshot(epoch)
+            if epoch % self.save_every == 0:
+                if self.gpu_id == 0:
+                    self._save_snapshot(epoch)
                 torch.distributed.barrier() 
 
 
