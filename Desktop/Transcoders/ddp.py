@@ -74,14 +74,19 @@ class Transcoders(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = int(input_dim * expansion_factor)
-        self.decoder = nn.Parameter(torch.zeros(self.latent_dim, self.input_dim))
+        
         dtype=torch.bfloat16
         #nn.init.kaiming_uniform_(self.decoder)
         self.encoder = nn.Linear(self.input_dim, self.latent_dim, dtype=torch.float32)
+        self.decoder = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
         self.encoder.bias.data.zero_()
         self.b_dec = nn.Parameter(torch.zeros(input_dim, dtype=dtype))
         self.W_skip = nn.Parameter(torch.zeros(input_dim, input_dim, dtype=dtype))
         self.batch_size=batch_size
+        self.global_step=1900
+        self.k_decay_steps=1000
+        self.initial_k=4096*10
+        self.final_k=32
         self.k_values=[32,128,256]
         
 
@@ -89,7 +94,13 @@ class Transcoders(nn.Module):
   
 
 
+  def get_current_k(self) -> int:
+        """Get the current k value based on a linear decay schedule."""
+        if self.global_step >= self.k_decay_steps:
+            return self.final_k
 
+        progress = self.global_step / self.k_decay_steps
+        return round(self.initial_k * (1 - progress) + self.final_k * progress)
   def encode(self, x: torch.Tensor, k : int) -> torch.Tensor:
 
 
@@ -103,29 +114,47 @@ class Transcoders(nn.Module):
         "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported() #speeds up forward by "2x"
     )
   def forward(self, x: torch.Tensor,MLP_output,device) -> Tuple[torch.Tensor, torch.Tensor]:
-        total_loss=0
-        mean_encoded=torch.empty(x.shape[0],self.latent_dim).to(device)
-        mean_decoded=torch.empty(x.shape[0],self.input_dim).to(device)
-        final_l0_norm=0
-        for i in self.k_values:
-          encoded = self.encode(x,i)
-          decoded = self.decode(x,encoded)
-          mean_encoded+=encoded
+      total_loss=0
+      if self.global_step>=1000:
+          
         
-          mean_decoded+=decoded
-          total_variance = (x - x.mean(0)).pow(2).sum()
-          loss= (MLP_output - decoded).pow(2).sum() 
-          total_loss+=loss
-        mean_encoded=mean_encoded/len(self.k_values)
-        mean_decoded=mean_decoded/len(self.k_values)
-        l0_norm = torch.count_nonzero(encoded,dim=0)
-        l0_norm_final=torch.sum(l0_norm)
+        k=self.get_current_k()
+        encoded = self.encode(x,k)
+        decoded = self.decode(x,encoded)
+        encoded_2=self.encode(x,k*4)
+        decoded_2=self.decode(x,encoded_2)
+          
+        total_variance = (x - x.mean(0)).pow(2).sum()
+        loss= (MLP_output - decoded).pow(2).sum() 
+        loss=loss/total_variance
         
-        total_loss=total_loss/ total_variance
-        approximation_of_l0_norm=torch.norm(mean_encoded, p=1)
+        loss_2=(MLP_output-decoded_2).pow(2).sum()
+        loss_2=loss_2/total_variance
+        total_loss=total_loss+loss+(loss_2/8)
+        self.global_step=self.global_step+1
+        print(f"global steps is{self.global_step}")  
+        return (encoded+encoded_2).mean(),(decoded+decoded_2).mean(),total_loss
+      else:
+        k=self.get_current_k()
+        encoded = self.encode(x,k)
+        decoded = self.decode(x,encoded)
+          
+        total_variance = (x - x.mean(0)).pow(2).sum()
+        loss= (MLP_output - decoded).pow(2).sum() 
+        loss=loss/total_variance
+        
+       
+        total_loss=total_loss+loss
+        self.global_step=self.global_step+1
+        print(f"global steps is{self.global_step}")  
+        return encoded,decoded,total_loss
+      
+      
         
         
-        return mean_encoded,mean_decoded,total_loss,l0_norm_final
+        
+        
+        
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -248,11 +277,10 @@ class Trainer:
             print(activations_flattened.shape)
             print(mlp_output_flattened.shape)
             self.optimizer.zero_grad()
-            encoded,decode,loss,l0_norm=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
+            encoded,decode,loss=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
             empirical_mean=mlp_output_flattened.mean(dim=-1)
             self.model1.module.b_dec.weight=empirical_mean
             print(loss)
-            print(l0_norm//(2048*11))
             loss.backward()
             self.optimizer.step()
             
@@ -272,11 +300,9 @@ class Trainer:
         print(activations_flattened.shape)
         print(mlp_output_flattened.shape)
         self.optimizer.zero_grad()
-        print(self.model1.module.decoder)
-        print(self.model1.module.W_skip)
-        encoded,decode,loss,l0_norm=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
+        
+        encoded,decode,loss=self.model1.module(activations_flattened,mlp_output_flattened,self.gpu_id)
         print(loss)
-        print(l0_norm//(2048*11))
         loss.backward()
         self.optimizer.step()
         
@@ -312,7 +338,7 @@ class Trainer:
             if epoch % self.save_every == 0:
                 if self.gpu_id == 0:
                     self._save_snapshot(epoch)
-                torch.distributed.barrier() 
+            torch.distributed.barrier() 
 
 
 def load_train_objs(batch_size):
